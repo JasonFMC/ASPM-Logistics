@@ -1,6 +1,11 @@
 export type LocationStatus = 'occupied' | 'empty' | 'pending_pickup' | 'special'
 export type ItemStatus = 'in_yard' | 'pending_pickup' | 'shipped' | 'special'
 export type MovementType = 'inbound' | 'outbound' | 'move' | 'adjust'
+export type TicketStatus = 'new' | 'in_progress' | 'waiting' | 'done' | 'cancelled'
+export type WaitingReason = 'customer' | 'truck' | 'paper' | 'other'
+export type TicketPriority = 'normal' | 'urgent'
+export type TicketSource = 'email' | 'manual'
+export type TicketBatch = 'test' | 'live'
 
 export interface Site {
   id: string
@@ -8,6 +13,8 @@ export interface Site {
   basemap_path: string | null
   basemap_width: number
   basemap_height: number
+  /** Real meters represented by one image pixel. Null until the basemap is calibrated. */
+  meters_per_pixel?: number | null
 }
 
 export interface Area {
@@ -66,6 +73,116 @@ export interface Movement {
   created_at: string
   from_location?: Pick<Location, 'code' | 'label'> | null
   to_location?: Pick<Location, 'code' | 'label'> | null
+}
+
+export interface Warehouse {
+  id: string
+  name: string
+  is_home: boolean
+  sort_order: number
+  archived: boolean
+}
+
+export interface Customer {
+  id: string
+  name: string
+  warehouse_id: string | null
+  archived: boolean
+}
+
+export interface Ticket {
+  id: string
+  title: string
+  summary: string | null
+  status: TicketStatus
+  source: TicketSource
+  batch: TicketBatch
+  warehouse_id: string | null
+  customer_id: string | null
+  is_new_sender: boolean
+  mailbox: string | null
+  message_id: string | null
+  imap_uid: number | null
+  from_name: string | null
+  from_email: string | null
+  received_at: string | null
+  claimed_by?: string | null
+  assignee?: { id: string; display_name: string; hue: number } | null
+  waiting_reason?: WaitingReason | null
+  due_at?: string | null
+  priority?: TicketPriority
+  item_id?: string | null
+  location_id?: string | null
+  facts?: TicketFacts | null
+  facts_confirmed_at?: string | null
+  closed_at?: string | null
+  created_at: string
+  updated_at: string
+  workflow_id?: string | null
+  warehouses?: Pick<Warehouse, 'id' | 'name'> | null
+  customers?: Pick<Customer, 'id' | 'name'> | null
+}
+
+export interface Workflow {
+  id: string
+  name: string
+  description: string | null
+}
+
+export type StageStatus = 'pending' | 'active' | 'waiting' | 'done' | 'skipped'
+
+export interface TicketStage {
+  id: string
+  ticket_id: string
+  step_key: string
+  name: string
+  description: string | null
+  sort_order: number
+  kind: string
+  optional: boolean
+  status: StageStatus
+  started_at: string | null
+  completed_at: string | null
+  remind_note: string | null
+}
+
+export interface StageAlert {
+  stage_id: string
+  ticket_id: string
+  stage_name: string
+  stage_status: 'active' | 'waiting'
+  started_at: string
+  remind_note: string | null
+  stuck_for: string
+  overdue_by: string
+  title: string
+  ticket_status: TicketStatus
+  warehouse_id: string | null
+}
+
+export interface TicketFacts {
+  reference?: string
+  qty?: string
+  note?: string
+}
+
+export interface TicketNote {
+  id: string
+  ticket_id: string
+  staff_id: string | null
+  author_name: string
+  body: string
+  created_at: string
+}
+
+export interface TicketEvent {
+  id: string
+  ticket_id: string
+  from_status: TicketStatus | null
+  to_status: TicketStatus
+  actor_id: string | null
+  note: string | null
+  created_at: string
 }
 
 export const LOCATION_COLORS: Record<LocationStatus, string> = {

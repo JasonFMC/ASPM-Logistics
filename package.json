@@ -1,5 +1,5 @@
 {
-  "name": "aspm-yard",
+  "name": "aspm-workshop",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -13,6 +13,7 @@
     "@supabase/supabase-js": "^2.116.0",
     "browser-image-compression": "^2.0.2",
     "leaflet": "^1.9.4",
+    "postal-mime": "^4.0.5",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-leaflet": "^5.0.0",

@@ -1,0 +1,15 @@
+---
+description: Keep the new-colleague setup section in README current after changes
+alwaysApply: true
+---
+
+# 新同事第一次使用
+
+`README.md` 里的「新同事第一次使用」是同事启用时的现行步骤，以这一节为准。
+
+后续只要有更新或更改，做完后把最终用法补进这一节：
+
+- 同事要新做的一步，写成一条检查项。
+- 原有步骤变了，改掉那一条，留下最终做法。
+- 不要把试过又放弃的做法留在这一节。
+- 只影响内部实现、同事启用和日常使用都不变的修改，不必加一条。

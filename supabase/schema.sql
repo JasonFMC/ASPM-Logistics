@@ -16,6 +16,8 @@ create table if not exists public.sites (
   basemap_path text,
   basemap_width int not null default 2000,
   basemap_height int not null default 1400,
+  -- real meters per image pixel; set by drawing a known ground length
+  meters_per_pixel double precision,
   created_at timestamptz not null default now()
 );
 
@@ -223,27 +225,9 @@ create policy "photos_auth_delete" on storage.objects for delete to authenticate
 create policy "photos_public_read" on storage.objects for select to anon
   using (bucket_id = 'photos');
 
--- Seed one site + default areas from PRD
+-- Seed: only create empty site. Areas are created by users via 新建区域 → 手绘 → 取名.
 insert into public.sites (name, basemap_width, basemap_height)
 select 'ASPM Yard', 2000, 1400
 where not exists (select 1 from public.sites);
 
-do $$
-declare
-  sid uuid;
-begin
-  select id into sid from public.sites limit 1;
-  insert into public.areas (site_id, code, name, color, sort_order) values
-    (sid, 'A', '广场右', '#2563eb', 1),
-    (sid, 'B', '广场左', '#16a34a', 2),
-    (sid, 'E', '办公室左', '#ca8a04', 3),
-    (sid, 'F', '办公室右', '#ea580c', 4),
-    (sid, 'G', '草地', '#65a30d', 5),
-    (sid, 'H', '3号门室内', '#0891b2', 6),
-    (sid, 'I', '4号门室外', '#7c3aed', 7),
-    (sid, 'J', '卷帘门', '#db2777', 8),
-    (sid, 'L', '广场正面左', '#0d9488', 9),
-    (sid, 'M', '广场正面中', '#4f46e5', 10),
-    (sid, 'N', '广场正面右', '#b45309', 11)
-  on conflict (site_id, code) do nothing;
-end $$;
+-- Tickets tables live in supabase/tickets.sql. Run that file too.

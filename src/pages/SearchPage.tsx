@@ -83,7 +83,7 @@ export function SearchPage() {
 
   return (
     <div className="page">
-      <h1>搜索</h1>
+      <h1>查找</h1>
       <form className="search-form" onSubmit={onSearch}>
         <input
           value={q}

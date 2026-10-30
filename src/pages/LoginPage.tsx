@@ -25,9 +25,9 @@ export function LoginPage() {
   return (
     <div className="login-page">
       <form className="login-card" onSubmit={onSubmit}>
-        <p className="eyebrow">场外位置真相源</p>
-        <h1>ASPM YARD</h1>
-        <p className="lede">登录后搜索货物、查看地图、拍照更新位置。</p>
+        <p className="eyebrow">ASPM</p>
+        <h1>ASPM Workshop</h1>
+        <p className="lede">登录后进入 Tickets 或 YARD。</p>
 
         <label>
           邮箱

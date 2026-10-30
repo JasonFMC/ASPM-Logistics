@@ -204,7 +204,7 @@ export function ItemPage() {
     setBusy(true)
     try {
       await shipItem(item, user.id)
-      navigate('/search')
+      navigate('/yard/search')
     } catch (err) {
       setError(err instanceof Error ? err.message : '操作失败')
       setBusy(false)
@@ -309,7 +309,7 @@ export function ItemPage() {
           </section>
 
           {item.locations && (
-            <Link className="btn secondary block" to={`/?loc=${item.locations.id}`}>
+            <Link className="btn secondary block" to={`/yard?loc=${item.locations.id}`}>
               在地图查看
             </Link>
           )}
