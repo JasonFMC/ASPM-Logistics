@@ -64,12 +64,110 @@ interface Frame {
 interface OpenedMail {
   letter: MailLetter
   files: Blob[]
+  /** 正文里的电子签名和粘贴图。不出现在附件列表里，点链接时按文件名取出。 */
+  linked: Map<string, Blob>
+  /** 写在署名之后的图。正文里粘贴的图不放这里。 */
+  signatures: Blob[]
+  /** 按原信段落排好的正文，图片在它原来的位置写成 [image:文件名]。 */
+  flowText: string
+  /** 出现在署名之后的图，按原信里的先后，不看文件名。 */
+  signatureNames: string[]
 }
 
 type Progress = (update: MailReadProgress) => void
 
 /** 拆信规则变了就加一。缓存里旧规则拆出的信会重新从邮箱取，附件序号才对得上。 */
-const LETTER_FORMAT = 3
+const LETTER_FORMAT = 5
+
+function fileBase(value: string) {
+  return value.split(/[/\\]/).pop()?.split('?')[0]?.split('@')[0]?.trim().toLowerCase() ?? ''
+}
+
+/** 邮箱署名里的小图标。image001.png 是贴进正文的图，不是署名。 */
+function signatureAssetName(value: string) {
+  const base = fileBase(value)
+  if (!base) return false
+  return /^(?:logo\d*|signature\d*|sign|sig|badge|banner|icon|outlook-[\w.-]+|~wrd\d+|mobilephone|emailaddress|website|address|phone|email|fax|linkedin|facebook|twitter|youtube|instagram)(?:\.(?:png|jpe?g|gif))?$/.test(base)
+}
+
+function genericSignatureName(value: string) {
+  return signatureAssetName(value)
+}
+
+function signoffAt(body: string) {
+  let offset = 0
+  const lines = body.split('\n')
+  let found = -1
+  for (const line of lines) {
+    const text = line.trim().replace(/[,，.。]+$/g, '')
+    if (/^(?:thanks|thank you|kind regards|best regards|warm regards|regards|cheers|sincerely)$/i.test(text)) found = offset
+    offset += line.length + 1
+  }
+  return found
+}
+
+function mentionAt(body: string, fileName: string) {
+  const stem = fileBase(fileName).replace(/\.[^.]+$/, '')
+  if (stem.length < 3) return -1
+  return body.toLowerCase().lastIndexOf(stem.toLowerCase())
+}
+
+function pastedImageName(value: string) {
+  const base = fileBase(value)
+  if (!base || signatureAssetName(base)) return false
+  return /^(?:image\d+|screenshot\d*|clipboard\d*|pastedimage\d*)(?:\.(?:png|jpe?g|gif|webp|bmp))?$/.test(base)
+    || /image\d+\.(?:png|jpe?g|gif)/.test(base)
+    || /截图|粘贴/.test(base)
+}
+
+/** 署名用的小图标，不计入附件。 */
+export function isSignatureFile(file: { name: string; type: string; size: number }) {
+  if (!signatureAssetName(file.name)) return false
+  return file.size <= 1_500_000
+}
+
+/** 正文里粘贴、由邮箱自动起名的图片，不计入附件。 */
+export function isPastedFile(file: { name: string; type: string; size: number }) {
+  return pastedImageName(file.name)
+}
+
+function looksLikeImage(file: { name: string; type: string }) {
+  const base = fileBase(file.name)
+  const extension = base.includes('.') ? base.split('.').pop() ?? '' : ''
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(extension)) return true
+  if (file.type.startsWith('image/')) return true
+  return /^image\d*$/.test(base.replace(/\.[^.]+$/, ''))
+}
+
+/**
+ * 署名图在发件人姓名之后。姓名之前的内嵌图留在正文。
+ * 正文没写到文件名时，不把图收进署名。
+ */
+export function isTrailingSignatureImage(file: { name: string; type: string; size: number }, body: string) {
+  if (isSignatureFile(file) || isPastedFile(file) || file.size > 1_500_000) return false
+  if (!looksLikeImage(file)) return false
+  const at = mentionAt(body, file.name)
+  const sign = signoffAt(body)
+  if (at < 0 || sign < 0) return false
+  return at > sign
+}
+
+/** 贴进正文的图：正文里还留着它的位置。没贴进正文的附件不算。 */
+function imageSitsInBody(fileName: string, body: string) {
+  const base = fileBase(fileName)
+  const stem = base.replace(/\.[^.]+$/, '')
+  if (stem.length < 3) return false
+  const lower = body.toLowerCase()
+  if (lower.includes(`[image:${stem}`) || lower.includes(`[image:${base}`) || lower.includes(`<${base}>`)) return true
+  const escaped = stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`\\[(?:cid:)?[^\\]\\n]*${escaped}(?:\\.(?:png|jpe?g|gif))?@[^\\]\\n]*\\]`, 'i').test(body)
+    || new RegExp(`(?:^|\\n)[^\\n]*${escaped}\\.(?:png|jpe?g|gif)@[^\\n]*(?:\\n|$)`, 'i').test(body)
+}
+
+/** 只看正文里有没有这张图的位置，不看文件名。 */
+export function isInlineBodyImage(file: { name: string; type: string; size: number }, body: string) {
+  return imageSitsInBody(file.name, body)
+}
 
 const KEEP_OPENED = 5
 const opened = new Map<string, OpenedMail>()
@@ -125,6 +223,29 @@ async function callMailRead(body: Record<string, unknown>, signal?: AbortSignal)
     throw new Error(`取信服务回复 ${response.status}：${message || response.statusText}`)
   }
   return response
+}
+
+function encodeHandoff(value: string) {
+  const bytes = new TextEncoder().encode(value)
+  let bin = ''
+  for (const byte of bytes) bin += String.fromCharCode(byte)
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
+/** 让本机 Outlook 打开这一封信的原文。不传 messageId 时打开任务上的第一封。 */
+export async function openOriginalMail(ticketId: string, messageId?: string) {
+  const response = await callMailRead({ ticketId, messageId, intent: 'outlook' })
+  const type = response.headers.get('content-type') || ''
+  if (!type.includes('application/json')) {
+    throw new Error('取信服务还是旧的。请把 mail-read 的代码贴到 Supabase 后再试。')
+  }
+  const payload = (await response.json()) as { token?: string; error?: string }
+  if (!payload.token) throw new Error(payload.error || '没有拿到打开凭据')
+  const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined
+  const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined
+  if (!supabaseUrl || !anonKey) throw new Error('未登录')
+  const link = `aspm-mail:${encodeHandoff(JSON.stringify({ url: supabaseUrl.replace(/\/$/, ''), key: anonKey, token: payload.token }))}`
+  window.location.assign(link)
 }
 
 function joinBytes(chunks: Uint8Array[], total: number) {
@@ -232,20 +353,75 @@ function cidOf(value: string) {
   return value.replace(/^cid:/i, '').replace(/^<|>$/g, '').trim().toLowerCase()
 }
 
-function toDataUrl(blob: Blob) {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result))
-    reader.onerror = () => reject(reader.error ?? new Error('图片读取失败'))
-    reader.readAsDataURL(blob)
-  })
-}
-
 const BLOCKED_TAGS = 'script, iframe, frame, frameset, object, embed, applet, form, link, base, meta[http-equiv]'
 const URL_ATTRS = new Set(['href', 'src', 'action', 'formaction', 'xlink:href', 'background'])
 
-/** 原信 HTML 只保留版式和内容：去掉脚本、外链、事件；内嵌图换成本地数据；链接在新标签页打开。 */
-function cleanHtml(raw: string, inline: Map<string, string>) {
+function byteLength(content: unknown) {
+  if (content instanceof Uint8Array || content instanceof ArrayBuffer) return content.byteLength
+  if (typeof content === 'string') return content.length
+  return 0
+}
+
+/** 署名之后的图片。姓名前面的粘贴图不算。 */
+function cidsAfterSignoff(html: string) {
+  const found = new Set<string>()
+  if (!html) return found
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+  const root = doc.body
+  if (!root) return found
+  let signoff: Node | null = null
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  let node = walker.nextNode()
+  while (node) {
+    const text = (node.textContent ?? '').replace(/\s+/g, ' ').trim().replace(/[,，.。]+$/g, '')
+    if (/^(?:thanks|thank you|kind regards|best regards|warm regards|regards|cheers|sincerely)$/i.test(text)) signoff = node
+    node = walker.nextNode()
+  }
+  if (!signoff) return found
+  doc.querySelectorAll('img').forEach((image) => {
+    if ((signoff.compareDocumentPosition(image) & Node.DOCUMENT_POSITION_FOLLOWING) === 0) return
+    const src = image.getAttribute('src') ?? ''
+    const cid = /^cid:/i.test(src) ? cidOf(src) : ''
+    if (cid) found.add(cid)
+  })
+  return found
+}
+
+/** 按原信 HTML 的阅读顺序写出正文。图片留在它所在的那一段，署名之后的图不写进正文。 */
+function flowFromHtml(html: string, nameByCid: Map<string, string>, signatureCids: Set<string>) {
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+  const root = doc.body
+  if (!root) return ''
+  const parts: string[] = []
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parts.push(node.textContent ?? '')
+      return
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return
+    const element = node as Element
+    const tag = element.tagName
+    if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'HEAD') return
+    if (tag === 'IMG') {
+      const src = element.getAttribute('src') ?? ''
+      const cid = /^cid:/i.test(src) ? cidOf(src) : ''
+      const name = cid ? nameByCid.get(cid) : ''
+      if (name && cid && !signatureCids.has(cid)) parts.push(`\n[image:${name}]\n`)
+      return
+    }
+    if (tag === 'BR') {
+      parts.push('\n')
+      return
+    }
+    for (const child of element.childNodes) walk(child)
+    if (/^(P|DIV|TR|LI|H[1-6]|TABLE|BLOCKQUOTE)$/.test(tag)) parts.push('\n')
+  }
+  walk(root)
+  return parts.join('').replace(/\u00a0/g, ' ').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+/** 原信 HTML 只保留版式和内容：去掉脚本、外链、事件。署名和粘贴图只留链接。 */
+function cleanHtml(raw: string, inline: Map<string, string>, marked: Map<string, { name: string; caption: string }>) {
   const doc = new DOMParser().parseFromString(raw, 'text/html')
   doc.querySelectorAll(BLOCKED_TAGS).forEach((node) => node.remove())
   doc.querySelectorAll('*').forEach((element) => {
@@ -257,9 +433,34 @@ function cleanHtml(raw: string, inline: Map<string, string>) {
   })
   doc.querySelectorAll('img[src]').forEach((image) => {
     const src = image.getAttribute('src') ?? ''
-    if (!/^cid:/i.test(src)) return
-    const data = inline.get(cidOf(src))
-    if (data) image.setAttribute('src', data)
+    const cid = /^cid:/i.test(src) ? cidOf(src) : ''
+    const mark = cid ? marked.get(cid) : undefined
+    const httpSrc = /^https?:\/\//i.test(src.trim()) ? src.trim() : ''
+    const httpCaption = httpSrc && genericSignatureName(httpSrc) ? '电子签名' : httpSrc && pastedImageName(httpSrc) ? '粘贴的图片' : ''
+    if (!mark && !httpCaption) {
+      if (!cid) return
+      const data = inline.get(cid)
+      if (data) image.setAttribute('src', data)
+      return
+    }
+    const parent = image.parentElement
+    const parentHref = parent?.tagName === 'A' ? (parent.getAttribute('href') ?? '').trim() : ''
+    const href = /^https?:\/\//i.test(parentHref) ? parentHref : httpSrc
+    const label = href || mark?.name || '图片'
+    const caption = mark?.caption || httpCaption
+    const fragment = doc.createDocumentFragment()
+    if (href) {
+      const link = doc.createElement('a')
+      link.setAttribute('href', href)
+      link.setAttribute('target', '_blank')
+      link.setAttribute('rel', 'noopener noreferrer')
+      link.textContent = label
+      fragment.append(link, doc.createTextNode(` ${caption}`))
+    } else {
+      fragment.append(doc.createTextNode(`${label} ${caption}`))
+    }
+    if (parent?.tagName === 'A' && parent.childNodes.length === 1) parent.replaceWith(fragment)
+    else image.replaceWith(fragment)
   })
   doc.querySelectorAll('a[href]').forEach((link) => {
     link.setAttribute('target', '_blank')
@@ -317,17 +518,47 @@ async function unpack(source: Uint8Array): Promise<OpenedMail> {
   }
 
   const html = email.html ?? ''
+  const signatureCids = cidsAfterSignoff(html)
   const referenced = new Set(Array.from(html.matchAll(/cid:([^"'\s)>]+)/gi), (match) => cidOf(match[1])))
   const inline = new Map<string, string>()
+  const marked = new Map<string, { name: string; caption: string }>()
   const files: Blob[] = []
   const attachments: MailFile[] = []
+  const linked = new Map<string, Blob>()
+  const signatures: Blob[] = []
+  const nameByCid = new Map<string, string>()
+  const keepLinked = (name: string, blob: Blob) => {
+    const key = name.trim().toLowerCase()
+    if (key && !linked.has(key)) linked.set(key, blob)
+    const mark = key.match(/image\d{1,3}\.(?:png|jpe?g|gif)/)?.[0]
+    if (mark && !linked.has(mark)) linked.set(mark, blob)
+  }
 
   for (const part of email.attachments) {
     const type = part.mimeType || 'application/octet-stream'
     const blob = new Blob([part.content as BlobPart], { type })
     const cid = part.contentId ? cidOf(part.contentId) : ''
-    if (cid && referenced.has(cid) && type.startsWith('image/')) {
-      inline.set(cid, await toDataUrl(blob))
+    const name = part.filename?.trim() || (cid ? cid.split('@')[0] : '')
+    const described = { name, type, size: byteLength(part.content) || blob.size }
+    if (cid && name) nameByCid.set(cid, name)
+    if (cid && signatureCids.has(cid)) {
+      signatures.push(blob)
+      marked.set(cid, { name: name || '签名', caption: '电子签名' })
+      keepLinked(name || '签名', blob)
+      if (cid) keepLinked(cid.split('@')[0], blob)
+      continue
+    }
+    if (cid && referenced.has(cid) && isSignatureFile(described)) {
+      signatures.push(blob)
+      marked.set(cid, { name: name || '签名', caption: '电子签名' })
+      keepLinked(name || '签名', blob)
+      if (cid) keepLinked(cid.split('@')[0], blob)
+      continue
+    }
+    if (cid && referenced.has(cid) && (isPastedFile(described) || type.startsWith('image/'))) {
+      marked.set(cid, { name: name || '图片', caption: '粘贴的图片' })
+      keepLinked(name || '图片', blob)
+      if (cid) keepLinked(cid.split('@')[0], blob)
       continue
     }
     attachments.push({
@@ -340,7 +571,7 @@ async function unpack(source: Uint8Array): Promise<OpenedMail> {
   }
 
   const body = html
-    ? cleanHtml(html, inline)
+    ? cleanHtml(html, inline, marked)
     : email.text
       ? plainHtml(email.text)
       : plainHtml('这封信没有正文。')
@@ -358,16 +589,41 @@ async function unpack(source: Uint8Array): Promise<OpenedMail> {
       attachments,
     },
     files,
+    linked,
+    signatures,
+    flowText: html ? flowFromHtml(html, nameByCid, signatureCids) : '',
+    signatureNames: [...signatureCids].map((cid) => nameByCid.get(cid) ?? '').filter(Boolean),
   }
 }
 
+/** 取出这封信，按原信段落给出正文和署名图。位置来自原信版式，不看文件名。 */
+export async function loadMessageFlow(ticketId: string, messageId: string) {
+  const cached = opened.get(`m:${messageId}`)
+  if (cached) return { text: cached.flowText, signatureNames: cached.signatureNames }
+  const mail = await openFromMailbox(ticketId, () => undefined, undefined, messageId)
+  return { text: mail.flowText, signatureNames: mail.signatureNames }
+}
+
+function fileBlob(mail: OpenedMail, file: MailFile) {
+  const named = mail.letter.attachments.find((item) => item.name.trim().toLowerCase() === file.name.trim().toLowerCase())
+  if (named) {
+    const blob = mail.files[named.index]
+    if (blob) return { blob, shown: named }
+  }
+  const linked = mail.linked.get(file.name.trim().toLowerCase())
+  if (linked) return { blob: linked, shown: file }
+  return null
+}
+
 /** 从邮箱取出整封原文并拆开。不看缓存。 */
-async function openFromMailbox(ticketId: string, onProgress: Progress, signal?: AbortSignal) {
-  const response = await callMailRead({ ticketId, fresh: true }, signal)
+async function openFromMailbox(ticketId: string, onProgress: Progress, signal?: AbortSignal, messageId?: string) {
+  const response = await callMailRead({ ticketId, messageId, fresh: true }, signal)
   const reply = await readFrames(response, onProgress)
   if (!reply.source) throw new Error('这张工单没有对应的邮件')
   const mail = await unpack(reply.source)
-  remember(ticketId, mail)
+  const key = messageId ? `m:${messageId}` : ticketId
+  remember(key, mail)
+  if (!messageId) saveLetter(ticketId, mail.letter)
   return mail
 }
 
@@ -441,6 +697,31 @@ const TEXT_EXTENSIONS = new Set(['txt', 'csv', 'log', 'json', 'xml', 'ics'])
 function extensionOf(name: string) {
   const dot = name.lastIndexOf('.')
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : ''
+}
+
+/** 文件名没有后缀时，用文件头判断是不是图片或 PDF。 */
+function sniffType(bytes: Uint8Array) {
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png'
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
+  if (bytes.length >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif'
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return 'image/webp'
+  }
+  if (bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4d) return 'image/bmp'
+  if (bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2d) {
+    return 'application/pdf'
+  }
+  return null
 }
 
 /** 先看扩展名：不少发件人把附件一律标成 application/octet-stream。 */
@@ -527,7 +808,11 @@ async function showMail(viewer: Viewer, blob: Blob) {
 }
 
 async function showFile(viewer: Viewer, file: MailFile, blob: Blob) {
-  const kind = viewKindOf(file)
+  const sniffed = sniffType(new Uint8Array(await blob.slice(0, 16).arrayBuffer()))
+  const typed =
+    sniffed || (blob.type.startsWith('image/') || blob.type === 'application/pdf' ? blob.type : '')
+  const shown = typed ? { ...file, type: typed } : file
+  const kind = viewKindOf(shown)
   if (kind === 'pdf') {
     const frame = viewer.element('iframe')
     frame.className = 'fill'
@@ -539,7 +824,7 @@ async function showFile(viewer: Viewer, file: MailFile, blob: Blob) {
     const image = viewer.element('img')
     image.alt = file.name
     image.src = viewer.tabUrl.createObjectURL(
-      new Blob([blob], { type: IMAGE_TYPES[extensionOf(file.name)] ?? file.type }),
+      new Blob([blob], { type: IMAGE_TYPES[extensionOf(shown.name)] ?? shown.type }),
     )
     box.append(image)
     viewer.main.append(box)
@@ -578,11 +863,94 @@ export async function openMailAttachment(ticketId: string, file: MailFile, tab: 
       (await openFromMailbox(ticketId, (update) => {
         viewer.status.textContent = `正在取附件：${update.step} ${update.pct}%`
       }))
-    const blob = mail.files[file.index]
-    if (!blob) throw new Error('这封信里没有这个附件了')
-    await showFile(viewer, file, blob)
+    const found = fileBlob(mail, file)
+    if (!found) throw new Error('这封信里没有这个附件了')
+    await showFile(viewer, found.shown, found.blob)
     viewer.status.remove()
-    if (viewKindOf(file) !== 'pdf') viewer.header.append(viewer.link(blob, file.name))
+    if (viewKindOf(found.shown) !== 'pdf') viewer.header.append(viewer.link(found.blob, found.shown.name))
+  } catch (err) {
+    viewer.status.className = 'status error'
+    viewer.status.textContent = err instanceof Error ? err.message : '附件打开失败'
+    throw err
+  }
+}
+
+/** 点 signature 时，整封只向邮箱取一次，抽出签名图。图只留在这一页的内存里，不写入数据库。 */
+export async function loadSignaturePictures(ticketId: string, messageId: string, files: MailFile[]) {
+  const mail =
+    opened.get(`m:${messageId}`) ??
+    (await openFromMailbox(ticketId, () => undefined, undefined, messageId))
+  const seen = new Set<Blob>()
+  const picked: { blob: Blob; name: string }[] = []
+  const take = (blob: Blob | null | undefined, name = '') => {
+    if (!blob || seen.has(blob)) return
+    seen.add(blob)
+    picked.push({ blob, name })
+  }
+  for (const blob of mail.signatures) take(blob, 'signature')
+  for (const file of files) take(signatureBlob(mail, file), file.name)
+  for (const [name, blob] of mail.linked) {
+    if (name === '图片' || pastedImageName(name)) continue
+    const asked = files.some((file) => {
+      const wanted = fileBase(file.name)
+      const have = fileBase(name)
+      return Boolean(wanted) && (wanted === have || have.includes(wanted) || wanted.includes(have))
+    })
+    if (!asked && !signatureAssetName(name)) continue
+    take(blob, name)
+  }
+  for (const item of mail.letter.attachments) {
+    const asked = files.some((file) => file.name.trim().toLowerCase() === item.name.trim().toLowerCase())
+    if (!asked && !signatureAssetName(item.name)) continue
+    take(mail.files[item.index], item.name)
+  }
+  const urls: string[] = []
+  for (const { blob, name } of picked) {
+    const head = new Uint8Array(await blob.slice(0, 16).arrayBuffer())
+    const sniffed = sniffType(head)
+    const type = (sniffed?.startsWith('image/') ? sniffed : '') || (blob.type.startsWith('image/') ? blob.type : '') || IMAGE_TYPES[extensionOf(name)] || ''
+    if (!type.startsWith('image/')) continue
+    urls.push(URL.createObjectURL(new Blob([blob], { type })))
+  }
+  return urls
+}
+
+function signatureBlob(mail: OpenedMail, file: MailFile) {
+  const found = fileBlob(mail, file)
+  if (found) return found.blob
+  const mark = file.name.match(/image\d{1,3}\.(?:png|jpe?g|gif)/i)?.[0]?.toLowerCase()
+  if (!mark) return null
+  for (const [name, blob] of mail.linked) {
+    if (name.toLowerCase().includes(mark)) return blob
+  }
+  for (const item of mail.letter.attachments) {
+    if (!item.name.toLowerCase().includes(mark)) continue
+    const blob = mail.files[item.index]
+    if (blob) return blob
+  }
+  return null
+}
+
+/** 打开任务里某一封信的附件。按文件名对上这次从原信拆出的附件，仍走原来的打开方式。 */
+export async function openMessageAttachment(ticketId: string, messageId: string, file: MailFile, tab: Window | null) {
+  if (!tab) throw new Error('浏览器拦住了新标签页。请在地址栏右侧允许本站弹出窗口，再点一次附件。')
+  const viewer = makeViewer(tab, file.name)
+  try {
+    const mail =
+      opened.get(`m:${messageId}`) ??
+      (await openFromMailbox(
+        ticketId,
+        (update) => {
+          viewer.status.textContent = `正在取附件：${update.step} ${update.pct}%`
+        },
+        undefined,
+        messageId,
+      ))
+    const found = fileBlob(mail, file)
+    if (!found) throw new Error('这封信里没有这个附件了')
+    await showFile(viewer, found.shown, found.blob)
+    viewer.status.remove()
+    if (viewKindOf(found.shown) !== 'pdf') viewer.header.append(viewer.link(found.blob, found.shown.name))
   } catch (err) {
     viewer.status.className = 'status error'
     viewer.status.textContent = err instanceof Error ? err.message : '附件打开失败'

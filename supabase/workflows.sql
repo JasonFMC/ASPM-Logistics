@@ -228,7 +228,6 @@ select
   t.status        as ticket_status,
   t.batch,
   t.warehouse_id,
-  t.customer_id,
   t.workflow_id
 from public.ticket_stages s
 join public.tickets t on t.id = s.ticket_id

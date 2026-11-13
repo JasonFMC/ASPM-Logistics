@@ -83,13 +83,6 @@ export interface Warehouse {
   archived: boolean
 }
 
-export interface Customer {
-  id: string
-  name: string
-  warehouse_id: string | null
-  archived: boolean
-}
-
 export interface Ticket {
   id: string
   title: string
@@ -98,8 +91,6 @@ export interface Ticket {
   source: TicketSource
   batch: TicketBatch
   warehouse_id: string | null
-  customer_id: string | null
-  is_new_sender: boolean
   mailbox: string | null
   message_id: string | null
   imap_uid: number | null
@@ -118,9 +109,9 @@ export interface Ticket {
   closed_at?: string | null
   created_at: string
   updated_at: string
+  mail_count?: number
   workflow_id?: string | null
   warehouses?: Pick<Warehouse, 'id' | 'name'> | null
-  customers?: Pick<Customer, 'id' | 'name'> | null
 }
 
 export interface Workflow {

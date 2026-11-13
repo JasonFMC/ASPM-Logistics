@@ -3,10 +3,14 @@ import { Layout } from './components/Layout'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { StaffProvider } from './context/StaffContext'
 import { isSupabaseConfigured } from './lib/supabase'
+import { ClaimPage } from './pages/ClaimPage'
+import { FolderPage } from './pages/FolderPage'
 import { HomePage } from './pages/HomePage'
 import { ItemPage } from './pages/ItemPage'
 import { LoginPage } from './pages/LoginPage'
 import { SetupPage } from './pages/SetupPage'
+import { ProfilePage } from './pages/ProfilePage'
+import { TicketSearchPage } from './pages/TicketSearchPage'
 import { TicketDetailPage, TicketNewPage, TicketsDuePage, TicketsListPage } from './pages/TicketsPage'
 import { StaffAdminPage } from './pages/StaffAdminPage'
 
@@ -47,10 +51,15 @@ export default function App() {
             <Route path="yard/manage" element={null} />
             <Route path="yard/search" element={null} />
             <Route path="yard/item/:id" element={<ItemPage />} />
+            <Route path="folders/:id" element={<FolderPage />} />
             <Route path="tickets" element={<TicketsListPage />} />
+            <Route path="tickets/folder/:folderId" element={<TicketsListPage />} />
+            <Route path="tickets/search" element={<TicketSearchPage />} />
             <Route path="tickets/new" element={<TicketNewPage />} />
             <Route path="tickets/due" element={<TicketsDuePage />} />
             <Route path="tickets/staff" element={<StaffAdminPage />} />
+            <Route path="tickets/profile" element={<ProfilePage />} />
+            <Route path="tickets/claim/:staffId" element={<ClaimPage />} />
             <Route path="tickets/:id" element={<TicketDetailPage />} />
             <Route path="manage" element={<Navigate to="/yard/manage" replace />} />
             <Route path="search" element={<Navigate to="/yard/search" replace />} />

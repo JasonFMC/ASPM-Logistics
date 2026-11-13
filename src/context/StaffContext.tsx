@@ -5,6 +5,7 @@ import {
   enterDesk,
   listStaff,
   loadDeskAdmin,
+  updateMyLook,
   updateMyStaff,
   type DeskPass,
   type StaffCard,
@@ -22,6 +23,7 @@ interface StaffState {
   register: (name: string, pin: string, look: FaceLook) => Promise<void>
   enter: (staffId: string, pin: string) => Promise<void>
   saveProfile: (name: string, pin: string) => Promise<void>
+  saveLook: (look: FaceLook) => Promise<void>
   leave: () => void
 }
 
@@ -111,9 +113,19 @@ export function StaffProvider({ children }: { children: ReactNode }) {
     [desk, remember, refresh],
   )
 
+  const saveLook = useCallback(
+    async (look: FaceLook) => {
+      if (!desk) throw new Error('请先进入员工身份')
+      const hue = await updateMyLook(desk.token, look)
+      remember({ ...desk, hue })
+      await refresh()
+    },
+    [desk, remember, refresh],
+  )
+
   const value = useMemo(
-    () => ({ people, admin, desk, ready, refresh, register, enter, saveProfile, leave }),
-    [people, admin, desk, ready, refresh, register, enter, saveProfile, leave],
+    () => ({ people, admin, desk, ready, refresh, register, enter, saveProfile, saveLook, leave }),
+    [people, admin, desk, ready, refresh, register, enter, saveProfile, saveLook, leave],
   )
 
   return <StaffContext.Provider value={value}>{children}</StaffContext.Provider>

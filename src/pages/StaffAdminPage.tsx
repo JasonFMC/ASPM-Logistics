@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, Navigate } from 'react-router-dom'
 import { CrewFace } from '../components/DeskGate'
+import { TicketTitle } from '../components/TicketTitle'
 import { useStaff } from '../context/StaffContext'
 import {
   deleteStaff,
@@ -8,6 +9,7 @@ import {
   missingStaffSetup,
   renameStaff,
   setStaffHidden,
+  setStaffPin,
   type AdminStaff,
 } from '../lib/staff'
 
@@ -23,6 +25,7 @@ export function StaffAdminPage() {
   const { admin, ready, refresh } = useStaff()
   const [rows, setRows] = useState<AdminStaff[]>([])
   const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [pins, setPins] = useState<Record<string, string>>({})
   const [error, setError] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [confirmId, setConfirmId] = useState<string | null>(null)
@@ -74,7 +77,7 @@ export function StaffAdminPage() {
       <p className="eyebrow">Tickets</p>
       <h1>员工</h1>
       <p className="lede">
-        员工自己改过的名字和密码会显示在这里。这次更新之前设的密码，要等本人改一次才会出现。改名后还是同一个账号，已经领的工单留在这个人身上。隐藏后，领取人列表和任务池里不再出现这个人，工单也不会退回未领取。只有从没领过工单的人可以删除。
+        员工自己改过的名字和密码会显示在这里。这次更新之前设的密码，要等本人或管理员改一次才会出现。改名后还是同一个账号，已经领的工单留在这个人身上。改密码后，这个人要重新输入新密码才能进入。隐藏后，领取人列表和任务池里不再出现这个人，工单也不会退回未领取。只有从没领过工单的人可以删除。
       </p>
       {error && <p className="page-status error">{error}</p>}
       {rows.length === 0 && !error && <p className="lede">还没有员工。</p>}
@@ -106,6 +109,30 @@ export function StaffAdminPage() {
                   >
                     改名
                   </button>
+                  <input
+                    value={pins[person.id] ?? ''}
+                    maxLength={20}
+                    autoComplete="off"
+                    placeholder="新密码"
+                    aria-label={`${person.display_name} 的新密码`}
+                    onChange={(event) => setPins((current) => ({ ...current, [person.id]: event.target.value }))}
+                  />
+                  <button
+                    type="button"
+                    className="btn small"
+                    disabled={busyId === person.id || (pins[person.id] ?? '').trim().length < 4}
+                    onClick={() =>
+                      void run(person.id, async () => {
+                        await setStaffPin(person.id, (pins[person.id] ?? '').trim())
+                        setPins((current) => ({ ...current, [person.id]: '' }))
+                      })
+                    }
+                  >
+                    改密码
+                  </button>
+                  <Link to={`/tickets/claim/${person.id}`} className="btn small ghost">
+                    自动领取
+                  </Link>
                   <button
                     type="button"
                     className="btn small ghost"
@@ -135,7 +162,9 @@ export function StaffAdminPage() {
                   <ul>
                     {person.tickets.map((ticket) => (
                       <li key={ticket.id}>
-                        <Link to={`/tickets/${ticket.id}`}>{ticket.title}</Link>
+                        <Link to={`/tickets/${ticket.id}`}>
+                          <TicketTitle ticketId={ticket.id} title={ticket.title} />
+                        </Link>
                       </li>
                     ))}
                   </ul>

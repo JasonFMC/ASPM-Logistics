@@ -1,42 +1,46 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
+import { TicketThread } from '../components/TicketThread'
+import { TicketTitle } from '../components/TicketTitle'
+import { useFolders } from '../context/FolderContext'
+import { useMailSync } from '../context/MailSyncContext'
 import {
-  addSenderToWhitelist,
   createManualTicket,
   getTicket,
   listTicketEvents,
+  listTicketNotes,
   listStageAlerts,
   listTicketStages,
   listTickets,
+  listTicketsByIds,
   listWarehouses,
   listWorkflows,
   missingTicketsTable,
-  originalMailUrl,
-  PULL_STEPS,
-  pullMail,
-  type PullProgress,
   ticketOpsHint,
-  type TicketListStatus,
+  type TicketPool,
   TICKET_SOURCE_LABEL,
   TICKET_STATUS_LABEL,
 } from '../lib/tickets'
 import {
   MAIL_CACHE_STEPS,
   MAIL_STEPS,
-  clearMailCache,
   openMailAttachment,
+  openMessageAttachment,
+  openOriginalMail,
   readMailLetter,
   type MailFile,
   type MailLetter,
   type MailReadProgress,
 } from '../lib/mailLetter'
+import { listTicketMessages, type TicketMessage } from '../lib/messages'
 import { MailFileIcon } from '../components/MailFileIcon'
 import { DeskGate } from '../components/DeskGate'
 import { TicketJob } from '../components/TicketJob'
 import { TicketPonds } from '../components/TicketPonds'
+import { TicketStepBar } from '../components/TicketStepBar'
 import { useStaff } from '../context/StaffContext'
-import { missingStaffSetup, claimTicket, releaseTicket } from '../lib/staff'
-import type { StageAlert, Ticket, TicketEvent, TicketStage, Warehouse, Workflow } from '../lib/types'
+import { applyAutoClaims, missingStaffSetup, claimTicket, releaseTicket } from '../lib/staff'
+import type { StageAlert, Ticket, TicketEvent, TicketNote, TicketStage, Warehouse, Workflow } from '../lib/types'
 
 function formatWhen(value: string | null) {
   if (!value) return ''
@@ -77,7 +81,7 @@ function setupHint(err: unknown) {
     return '还没有工单表。请在 Supabase SQL Editor 运行 supabase/tickets.sql。'
   }
   if (missingStaffSetup(message)) {
-    if (/p_look|hidden|has_claimed|rename_staff|admin_staff_list|could not find the function/i.test(message)) {
+    if (/p_look|hidden|has_claimed|rename_staff|admin_staff_list|set_staff_pin|update_my_look|could not find the function/i.test(message)) {
       return '同事表还是旧的。请在 Supabase SQL Editor 再运行一遍 supabase/staff.sql。'
     }
     return '还没有同事表。请在 Supabase SQL Editor 运行 supabase/staff.sql。'
@@ -135,38 +139,44 @@ function StepProgress({
   )
 }
 
-function TicketProgress({ status }: { status: string }) {
-  if (status === 'cancelled') return <p className="ticket-cancelled">已取消</p>
-  const steps = ['new', 'in_progress', 'waiting', 'done'] as const
-  return (
-    <ol className="ticket-progress" aria-label="工单状态">
-      {steps.map((step) => {
-        const current = step === status
-        return (
-          <li
-            key={step}
-            className={current ? `is-current status-${step}` : undefined}
-            aria-current={current ? 'step' : undefined}
-          >
-            {TICKET_STATUS_LABEL[step]}
-          </li>
-        )
-      })}
-    </ol>
-  )
-}
-
 export function TicketsListPage() {
+  const { folderId } = useParams()
+  const navigate = useNavigate()
+  const { folders, memberships } = useFolders()
+  const { generation, running, status, pct, failed, syncNow } = useMailSync()
+  const folder = folders.find((row) => row.id === folderId) ?? null
   const [tickets, setTickets] = useState<Ticket[]>([])
+  const [folderTickets, setFolderTickets] = useState<Ticket[]>([])
   const [warehouses, setWarehouses] = useState<Warehouse[]>([])
-  const [status, setStatus] = useState<TicketListStatus>('open')
+  const [pool, setPool] = useState<TicketPool>('unassigned')
   const [warehouseId, setWarehouseId] = useState<string | 'all'>('all')
   const [busy, setBusy] = useState(true)
-  const [syncing, setSyncing] = useState(false)
-  const [pullProgress, setPullProgress] = useState<PullProgress | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
   const { desk, ready: staffReady } = useStaff()
+  const loadSeq = useRef(0)
+  const userSeq = useRef(0)
+  const filterRef = useRef({ pool, warehouseId })
+  filterRef.current = { pool, warehouseId }
+
+  async function reloadTickets(kind: 'nav' | 'user' | 'sync') {
+    const seq = ++loadSeq.current
+    const seenUser = userSeq.current
+    if (kind !== 'sync') userSeq.current += 1
+    if (kind === 'nav') {
+      setBusy(true)
+      setError(null)
+    }
+    try {
+      const rows = await listTickets(filterRef.current)
+      if (seq !== loadSeq.current) return
+      if (kind === 'sync' && seenUser !== userSeq.current) return
+      setTickets(rows)
+    } catch (err: unknown) {
+      if (kind !== 'sync' && seq === loadSeq.current) setError(setupHint(err))
+    } finally {
+      if (kind === 'nav' && seq === loadSeq.current) setBusy(false)
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -184,50 +194,50 @@ export function TicketsListPage() {
 
   useEffect(() => {
     let cancelled = false
+    const seq = ++loadSeq.current
+    userSeq.current += 1
     setBusy(true)
     setError(null)
-    void listTickets({ status, warehouseId })
+    void listTickets({ pool, warehouseId })
       .then((rows) => {
-        if (!cancelled) setTickets(rows)
+        if (!cancelled && seq === loadSeq.current) setTickets(rows)
       })
       .catch((err: unknown) => {
-        if (!cancelled) setError(setupHint(err))
+        if (!cancelled && seq === loadSeq.current) setError(setupHint(err))
       })
       .finally(() => {
-        if (!cancelled) setBusy(false)
+        if (!cancelled && seq === loadSeq.current) setBusy(false)
       })
     return () => {
       cancelled = true
     }
-  }, [status, warehouseId])
+  }, [pool, warehouseId])
 
-  async function onPull() {
-    setSyncing(true)
-    setNotice(null)
-    setError(null)
-    setPullProgress({ pct: 0, step: '正在送出请求' })
-    try {
-      const result = await pullMail(setPullProgress)
-      setPullProgress({ pct: 100, step: '完成' })
-      const more = (result.pending ?? 0) > 0
-      if ((result.updated ?? 0) > 0) clearMailCache()
-      setNotice(
-        [
-          result.mailbox ? `登录的是 ${result.mailbox}。` : '',
-          `新建 ${result.inserted} 单，标题更新 ${result.updated ?? 0} 张，未改 ${result.skipped} 封，其中 ${result.newSenders} 封来自新客户。`,
-          more ? `10月19日起还有 ${result.pending} 封没建单，再点一次拉取。` : '',
-        ]
-          .filter(Boolean)
-          .join(''),
-      )
-      setTickets(await listTickets({ status, warehouseId }))
-      setPullProgress(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '拉取失败')
-    } finally {
-      setSyncing(false)
+  useEffect(() => {
+    if (!generation) return
+    void reloadTickets('sync')
+    // 只跟邮箱对齐的次数走。筛选变化由上面的加载负责。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generation])
+
+  useEffect(() => {
+    if (!folderId) {
+      setFolderTickets([])
+      return
     }
-  }
+    const ids = memberships.filter((item) => item.folder_id === folderId).map((item) => item.ticket_id)
+    let cancelled = false
+    void listTicketsByIds(ids)
+      .then((rows) => {
+        if (!cancelled) setFolderTickets(rows.filter((ticket) => ticket.status !== 'done'))
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setError(setupHint(err))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [folderId, memberships])
 
   if (!staffReady || !desk) {
     return (
@@ -243,44 +253,41 @@ export function TicketsListPage() {
       <p className="eyebrow">Tickets</p>
       <div className="ticket-head">
         <h1>任务池</h1>
-        <div className="ticket-head-actions">
-          <button
-            type="button"
-            className="btn secondary"
-            disabled={syncing}
-            onClick={() => void onPull()}
-          >
-            {syncing ? '拉取中…' : '拉取新邮件'}
+        <div className="mail-sync">
+          <div className={`mail-sync-bar ${running ? 'is-running' : ''} ${failed ? 'is-failed' : ''}`} role="status">
+            <span className="mail-sync-fill" style={{ width: `${running && !failed ? pct : 100}%` }} />
+            <span className="mail-sync-label">{running ? `${status} ${pct}%` : status}</span>
+          </div>
+          <button type="button" className="btn secondary" disabled={running} onClick={syncNow}>
+            {running ? '更新中…' : '更新邮件'}
           </button>
         </div>
       </div>
-      <p className="lede">左边是还没人领的。紧急的和约了时间的排在前面。办完和取消的会离开池子。</p>
-      {pullProgress && (
-        <StepProgress
-          pct={pullProgress.pct}
-          step={pullProgress.step}
-          steps={PULL_STEPS}
-          detail={pullProgress.detail}
-        />
-      )}
+      <p className="lede">未分配是还没分给同事的新任务。客户已经交给某位同事时，对得上的新任务会记到这个人身上。处理中能看到这位同事领走的任务，包括还在等客户的。等待上会标出原因。</p>
+      {failed && status && <p className="page-status error">{status}</p>}
 
-      <div className="ticket-filters">
+      <div className="ticket-filters" aria-label="工单筛选">
         {(
           [
-            ['open', '进行中的'],
-            ['new', '待处理'],
-            ['in_progress', '处理中'],
+            ['unassigned', '未分配'],
+            ['claimed', '处理中'],
             ['waiting', '等待'],
-            ['done', '已完成'],
-            ['cancelled', '已取消'],
+            ['done', '确认完成'],
             ['all', '全部'],
           ] as const
         ).map(([key, label]) => (
           <button
             key={key}
             type="button"
-            className={`btn small ${status === key ? 'secondary' : 'ghost'}`}
-            onClick={() => setStatus(key)}
+            className={`btn small ${pool === key && !(key === 'unassigned' && folderId) ? 'is-picked' : 'ghost'}`}
+            onClick={() => {
+              if (key === 'unassigned' && folderId) {
+                setPool('unassigned')
+                navigate('/tickets')
+                return
+              }
+              setPool(key)
+            }}
           >
             {label}
           </button>
@@ -309,10 +316,19 @@ export function TicketsListPage() {
         </div>
       )}
 
-      {notice && <p className="ticket-note">{notice}</p>}
       {error && <p className="page-status error">{error}</p>}
       {busy && <p className="page-status">加载工单…</p>}
-      <TicketPonds tickets={tickets} onChanged={async () => setTickets(await listTickets({ status, warehouseId }))} />
+      <TicketPonds
+        tickets={tickets}
+        pool={pool}
+        folder={folderId ? { id: folderId, name: folder?.name ?? '归类' } : null}
+        folderTickets={folderTickets}
+        onBack={() => {
+          setPool('unassigned')
+          navigate('/tickets')
+        }}
+        onChanged={() => reloadTickets('user')}
+      />
     </div>
   )
 }
@@ -348,11 +364,11 @@ export function TicketsDuePage() {
     <div className="module-page ticket-page">
       <p className="eyebrow">Tickets</p>
       <div className="ticket-head">
-        <h1>超时待办</h1>
+        <h1>提醒</h1>
       </div>
       <p className="lede">当前步骤停得超过设定天数的工单。做完或跳过之后，会从这里消失。</p>
       {error && <p className="page-status error">{error}</p>}
-      {busy && <p className="page-status">加载待办…</p>}
+      {busy && <p className="page-status">加载提醒…</p>}
       {!busy && !error && alerts.length === 0 && (
         <p className="lede">现在没有超时的步骤。给工单套上流程，并让当前步骤超过提醒天数后，会出现在这里。</p>
       )}
@@ -361,9 +377,11 @@ export function TicketsDuePage() {
           <li key={alert.stage_id}>
             <Link className="ticket-card" to={`/tickets/${alert.ticket_id}`}>
               <div className="ticket-card-top">
-                <strong>{alert.title}</strong>
+                <strong>
+                  <TicketTitle ticketId={alert.ticket_id} title={alert.title} done={alert.ticket_status === 'done'} />
+                </strong>
               </div>
-              <TicketProgress status={alert.ticket_status} />
+              <TicketStepBar status={alert.ticket_status} />
               <p>
                 {alert.stage_status === 'waiting' ? '等待中' : '进行中'}
                 {' · '}
@@ -386,6 +404,7 @@ export function TicketsDuePage() {
 
 export function TicketNewPage() {
   const navigate = useNavigate()
+  const { collectAll } = useFolders()
   const [warehouses, setWarehouses] = useState<Warehouse[]>([])
   const [warehouseId, setWarehouseId] = useState('')
   const [title, setTitle] = useState('')
@@ -415,6 +434,16 @@ export function TicketNewPage() {
     setError(null)
     try {
       const ticket = await createManualTicket({ title, summary, warehouseId: warehouseId || null })
+      try {
+        await collectAll()
+      } catch {
+        /* 归类没接上时，工单仍然建好 */
+      }
+      try {
+        await applyAutoClaims()
+      } catch {
+        /* 自动领取还没建好时，工单仍然建好 */
+      }
       navigate(`/tickets/${ticket.id}`)
     } catch (err) {
       setError(setupHint(err))
@@ -460,23 +489,30 @@ export function TicketNewPage() {
 
 export function TicketDetailPage() {
   const { id } = useParams()
+  const { namesByTicket } = useFolders()
   const [ticket, setTicket] = useState<Ticket | null>(null)
   const [events, setEvents] = useState<TicketEvent[]>([])
   const [warehouses, setWarehouses] = useState<Warehouse[]>([])
   const [workflows, setWorkflows] = useState<Workflow[]>([])
   const [stages, setStages] = useState<TicketStage[]>([])
-  const [customerName, setCustomerName] = useState('')
   const [busy, setBusy] = useState(true)
-  const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [letter, setLetter] = useState<MailLetter | null>(null)
   const [letterState, setLetterState] = useState<'idle' | 'loading' | 'ready' | 'missing' | 'failed'>('idle')
   const [letterError, setLetterError] = useState<string | null>(null)
   const [mailProgress, setMailProgress] = useState<MailReadProgress>({ pct: 0, step: '正在送出请求' })
   const [openingFile, setOpeningFile] = useState<number | null>(null)
+  const [openingMail, setOpeningMail] = useState(false)
+  const [openingMessage, setOpeningMessage] = useState<string | null>(null)
+  const [openingMessageFile, setOpeningMessageFile] = useState<string | null>(null)
+  const [messages, setMessages] = useState<TicketMessage[] | null | undefined>(undefined)
+  const { generation } = useMailSync()
   const { desk, admin } = useStaff()
   const [claimError, setClaimError] = useState<string | null>(null)
   const [claiming, setClaiming] = useState(false)
+  const [showLog, setShowLog] = useState(false)
+  const [notes, setNotes] = useState<TicketNote[]>([])
+  const [noteVersion, setNoteVersion] = useState(0)
 
   useEffect(() => {
     let cancelled = false
@@ -484,6 +520,7 @@ export function TicketDetailPage() {
       if (!id) return
       setBusy(true)
       setError(null)
+      setShowLog(false)
       try {
         const [row, history, sites, flows, stageRows] = await Promise.all([
           getTicket(id),
@@ -512,9 +549,46 @@ export function TicketDetailPage() {
   }, [id])
 
   useEffect(() => {
-    if (!id || !ticket?.imap_uid) {
-      setLetter(null)
-      setLetterState(ticket ? 'missing' : 'idle')
+    if (!id) return
+    let cancelled = false
+    void listTicketNotes(id)
+      .then((rows) => {
+        if (!cancelled) setNotes(rows)
+      })
+      .catch(() => {
+        if (!cancelled) setNotes([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [id, noteVersion])
+
+  useEffect(() => {
+    if (!id) return
+    setMessages(undefined)
+    let cancelled = false
+    void listTicketMessages(id)
+      .then((rows) => {
+        if (!cancelled) setMessages(rows)
+      })
+      .catch(() => {
+        if (!cancelled) setMessages(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [id, generation])
+
+  useEffect(() => {
+    const firstNeedsLetter = !messages || messages.length === 0 || messages[0].attachments.length === 0
+    if (!id || messages === undefined || !ticket?.imap_uid || !firstNeedsLetter) {
+      if (messages && messages.length > 0 && messages[0].attachments.length > 0) {
+        setLetter(null)
+        setLetterState('missing')
+      } else if (messages !== undefined && !ticket?.imap_uid) {
+        setLetter(null)
+        setLetterState(ticket ? 'missing' : 'idle')
+      }
       return
     }
     let cancelled = false
@@ -544,7 +618,50 @@ export function TicketDetailPage() {
       cancelled = true
       controller.abort()
     }
-  }, [id, ticket?.imap_uid])
+  }, [id, ticket?.imap_uid, messages])
+
+  async function onOpenMessage(messageId: string) {
+    if (!id) return
+    setOpeningMessage(messageId)
+    setLetterError(null)
+    try {
+      await openOriginalMail(id, messageId)
+    } catch (err) {
+      setLetterError(err instanceof Error ? err.message : '原邮件没有打开')
+    } finally {
+      setOpeningMessage(null)
+    }
+  }
+
+  async function onOpenMessageFile(messageId: string, file: MailFile) {
+    if (!id) return
+    const tab = window.open('', '_blank')
+    const primary = messages?.[0]
+    const fromLetter = primary && messageId === primary.id && primary.attachments.length === 0
+    setOpeningMessageFile(`${messageId}:${file.index}`)
+    setLetterError(null)
+    try {
+      if (fromLetter) await openMailAttachment(id, file, tab)
+      else await openMessageAttachment(id, messageId, file, tab)
+    } catch (err) {
+      setLetterError(err instanceof Error ? err.message : '附件打开失败')
+    } finally {
+      setOpeningMessageFile(null)
+    }
+  }
+
+  async function onOpenOriginal() {
+    if (!id) return
+    setOpeningMail(true)
+    setLetterError(null)
+    try {
+      await openOriginalMail(id)
+    } catch (err) {
+      setLetterError(err instanceof Error ? err.message : '原邮件没有打开')
+    } finally {
+      setOpeningMail(false)
+    }
+  }
 
   async function onOpenFile(file: MailFile) {
     if (!id) return
@@ -572,21 +689,6 @@ export function TicketDetailPage() {
     setStages(stageRows)
   }
 
-  async function onWhitelist(e: FormEvent) {
-    e.preventDefault()
-    if (!ticket) return
-    setSaving(true)
-    setError(null)
-    try {
-      setTicket(await addSenderToWhitelist(ticket, customerName))
-      setCustomerName('')
-    } catch (err) {
-      setError(setupHint(err))
-    } finally {
-      setSaving(false)
-    }
-  }
-
   if (busy) return <p className="page-status">加载工单…</p>
   if (!ticket) return <p className="page-status error">{error}</p>
 
@@ -611,54 +713,53 @@ export function TicketDetailPage() {
               </span>
             </p>
           )}
-          <h1>{letter?.subject || ticket.title}</h1>
+          <h1>
+            <TicketTitle
+              ticketId={ticket.id}
+              title={letter?.subject || ticket.title}
+              done={ticket.status === 'done'}
+              colleagues={ticket.assignee ? [ticket.assignee.display_name] : []}
+            />
+          </h1>
         </div>
       </div>
-      <TicketProgress status={ticket.status} />
-      {desk && (
+      <TicketStepBar status={ticket.status} claimedBy={ticket.claimed_by} waitingReason={ticket.waiting_reason} />
+      {notes.length > 0 && (
+        <section className="task-notes" aria-label="备注">
+          <h2>备注</h2>
+          <ul>
+            {notes.map((note) => (
+              <li key={note.id}>
+                <p>{note.body}</p>
+                <p className="task-note-by">
+                  {note.author_name || '同事'}
+                  {note.created_at ? ` · ${formatWhen(note.created_at)}` : ''}
+                </p>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+      {letterError && <p className="page-status error">{letterError}</p>}
+      {(messages && messages.length > 0) ? (
+        <TicketThread
+          ticketId={ticket.id}
+          messages={messages}
+          openingMail={openingMessage}
+          openingFile={openingMessageFile}
+          fallbackFiles={messages[0].attachments.length === 0 ? (letter?.attachments ?? []) : []}
+          onOpenMail={(messageId) => void onOpenMessage(messageId)}
+          onOpenFile={(messageId, file) => void onOpenMessageFile(messageId, file)}
+        />
+      ) : (
+      <>
+      {(ticket.imap_uid || ticket.message_id) && (
         <p className="ticket-note">
-          {(() => {
-            const current = stages.find((stage) => stage.status === 'active' || stage.status === 'waiting')
-            const who = ticket.assignee ? `由 ${ticket.assignee.display_name} 负责` : '还没有人领取'
-            return current ? `当前环节是「${current.name}」。${who}` : who
-          })()}
-          {!ticket.claimed_by && (
-            <button
-              type="button"
-              className="btn small"
-              disabled={claiming}
-              onClick={() => {
-                setClaiming(true)
-                setClaimError(null)
-                void claimTicket(ticket.id, desk.token)
-                  .then(async () => setTicket(await getTicket(ticket.id)))
-                  .catch((err: unknown) => setClaimError(err instanceof Error ? err.message : '没有领到'))
-                  .finally(() => setClaiming(false))
-              }}
-            >
-              领取任务
-            </button>
-          )}
-          {ticket.claimed_by && (ticket.claimed_by === desk.id || admin) && (
-            <button
-              type="button"
-              className="btn small ghost"
-              disabled={claiming}
-              onClick={() => {
-                setClaiming(true)
-                setClaimError(null)
-                void releaseTicket(ticket.id, desk.token)
-                  .then(async () => setTicket(await getTicket(ticket.id)))
-                  .catch((err: unknown) => setClaimError(err instanceof Error ? err.message : '没有放回'))
-                  .finally(() => setClaiming(false))
-              }}
-            >
-              放回
-            </button>
-          )}
+          <button type="button" className="btn small" disabled={openingMail} onClick={() => void onOpenOriginal()}>
+            {openingMail ? '正在交给 Outlook…' : '打开原邮件'}
+          </button>
         </p>
       )}
-      {claimError && <p className="page-status error">{claimError}</p>}
       {(letterState === 'loading' || letterState === 'failed') && (
         <MailLoadProgress pct={mailProgress.pct} step={mailProgress.step} />
       )}
@@ -735,13 +836,8 @@ export function TicketDetailPage() {
             : ticket.summary || '没有摘录。'}
         </p>
       )}
-      {letterError && <p className="page-status error">{letterError}</p>}
-      {originalMailUrl(ticket) && (
-        <p className="ticket-note">
-          <a href={originalMailUrl(ticket)!}>打开原邮件</a>
-        </p>
+      </>
       )}
-
       <dl className="ticket-facts">
         <div>
           <dt>来源</dt>
@@ -755,7 +851,12 @@ export function TicketDetailPage() {
         </div>
         <div>
           <dt>客户</dt>
-          <dd>{ticket.customers?.name || (ticket.is_new_sender ? '新客户' : '—')}</dd>
+          <dd>
+            {(namesByTicket.get(ticket.id) ?? [])
+              .filter((item) => item.kind === 'customer')
+              .map((item) => item.name)
+              .join('、') || '—'}
+          </dd>
         </div>
         <div>
           <dt>收到</dt>
@@ -769,38 +870,75 @@ export function TicketDetailPage() {
         workflows={workflows}
         warehouses={warehouses}
         onChanged={reloadTicket}
+        onNoted={() => setNoteVersion((version) => version + 1)}
       />
 
       {error && <p className="page-status error">{error}</p>}
 
-      {ticket.is_new_sender && ticket.from_email && (
-        <form className="ticket-whitelist" onSubmit={(e) => void onWhitelist(e)}>
-          <label>
-            认成固定客户
-            <input
-              value={customerName}
-              onChange={(e) => setCustomerName(e.target.value)}
-              placeholder="客户名"
-              maxLength={120}
-            />
-          </label>
-          <button type="submit" className="btn small secondary" disabled={saving}>
-            加进白名单
-          </button>
-          <p className="ticket-note">以后 {ticket.from_email} 来信直接归到这个客户。</p>
-        </form>
+      <button
+        type="button"
+        className="btn ticket-log-toggle"
+        aria-expanded={showLog}
+        onClick={() => setShowLog((open) => !open)}
+      >
+        操作记录
+      </button>
+      {showLog && (
+        <ol className="ticket-history">
+          {events.length === 0 && <li>还没有操作记录</li>}
+          {events.map((event) => (
+            <li key={event.id}>
+              <span>{TICKET_STATUS_LABEL[event.to_status]}</span>
+              <span>{event.note || ''}</span>
+              <span>{formatWhen(event.created_at)}</span>
+            </li>
+          ))}
+        </ol>
       )}
-
-      <h2 className="ticket-history-title">记录</h2>
-      <ol className="ticket-history">
-        {events.map((event) => (
-          <li key={event.id}>
-            <span>{TICKET_STATUS_LABEL[event.to_status]}</span>
-            <span>{event.note || ''}</span>
-            <span>{formatWhen(event.created_at)}</span>
-          </li>
-        ))}
-      </ol>
+      {desk && (
+        <p className="ticket-note">
+          {(() => {
+            const current = stages.find((stage) => stage.status === 'active' || stage.status === 'waiting')
+            const who = ticket.assignee ? `由 ${ticket.assignee.display_name} 负责` : '还没有人领取'
+            return current ? `当前环节是「${current.name}」。${who}` : who
+          })()}
+          {!ticket.claimed_by && (
+            <button
+              type="button"
+              className="btn small"
+              disabled={claiming}
+              onClick={() => {
+                setClaiming(true)
+                setClaimError(null)
+                void claimTicket(ticket.id, desk.token)
+                  .then(async () => setTicket(await getTicket(ticket.id)))
+                  .catch((err: unknown) => setClaimError(err instanceof Error ? err.message : '没有领到'))
+                  .finally(() => setClaiming(false))
+              }}
+            >
+              领取任务
+            </button>
+          )}
+          {ticket.claimed_by && (ticket.claimed_by === desk.id || admin) && (
+            <button
+              type="button"
+              className="btn small ghost"
+              disabled={claiming}
+              onClick={() => {
+                setClaiming(true)
+                setClaimError(null)
+                void releaseTicket(ticket.id, desk.token)
+                  .then(async () => setTicket(await getTicket(ticket.id)))
+                  .catch((err: unknown) => setClaimError(err instanceof Error ? err.message : '没有放回'))
+                  .finally(() => setClaiming(false))
+              }}
+            >
+              放回
+            </button>
+          )}
+        </p>
+      )}
+      {claimError && <p className="page-status error">{claimError}</p>}
     </div>
   )
 }

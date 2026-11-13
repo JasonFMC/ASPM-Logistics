@@ -155,7 +155,7 @@ export function DeskGate() {
                 />
               </label>
               <button type="submit" className="btn buddy-go" disabled={busy}>
-                {busy ? '正在加入…' : '就这个，进池子'}
+                {busy ? '正在加入…' : '就这个，进任务池'}
               </button>
             </form>
           </div>

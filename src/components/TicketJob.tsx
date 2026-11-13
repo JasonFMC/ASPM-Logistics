@@ -6,7 +6,6 @@ import {
   applyWorkflow,
   describeTarget,
   finishStage,
-  listTicketNotes,
   saveTicketJob,
   searchYard,
   setTicketStatus,
@@ -19,7 +18,6 @@ import {
 } from '../lib/tickets'
 import type {
   Ticket,
-  TicketNote,
   TicketStage,
   WaitingReason,
   Warehouse,
@@ -67,12 +65,14 @@ export function TicketJob({
   workflows,
   warehouses,
   onChanged,
+  onNoted,
 }: {
   ticket: Ticket
   stages: TicketStage[]
   workflows: Workflow[]
   warehouses: Warehouse[]
   onChanged: () => Promise<void>
+  onNoted: () => void
 }) {
   const { desk } = useStaff()
   const [reason, setReason] = useState<WaitingReason>(ticket.waiting_reason ?? 'customer')
@@ -86,7 +86,6 @@ export function TicketJob({
   const [hits, setHits] = useState<{ items: YardItemHit[]; locations: YardPlaceHit[] }>({ items: [], locations: [] })
   const [itemLabel, setItemLabel] = useState('')
   const [placeLabel, setPlaceLabel] = useState('')
-  const [notes, setNotes] = useState<TicketNote[]>([])
   const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -116,20 +115,6 @@ export function TicketJob({
       cancelled = true
     }
   }, [ticket])
-
-  useEffect(() => {
-    let cancelled = false
-    void listTicketNotes(ticket.id)
-      .then((rows) => {
-        if (!cancelled) setNotes(rows)
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) setError(hint(err))
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [ticket.id, ticket.updated_at])
 
   async function run(action: () => Promise<void>) {
     setBusy(true)
@@ -441,17 +426,7 @@ export function TicketJob({
 
       <section>
         <h2>备注</h2>
-        <p className="ticket-note">写给下一位的话。备注不改状态。</p>
-        <ul className="note-list">
-          {notes.map((note) => (
-            <li key={note.id}>
-              <strong>{note.author_name || '同事'}</strong>
-              <span>{note.body}</span>
-              <span className="pond-meta">{formatWhen(note.created_at)}</span>
-            </li>
-          ))}
-        </ul>
-        {notes.length === 0 && <p className="lede">还没有备注。</p>}
+        <p className="ticket-note">写给下一位的话。保存后出现在消息前面。备注不改状态。</p>
         <form
           className="job-fields"
           onSubmit={(e: FormEvent) => {
@@ -460,7 +435,7 @@ export function TicketJob({
             void run(async () => {
               await addTicketNote(ticket.id, text, desk?.id ?? null, desk?.display_name ?? '同事')
               setDraft('')
-              setNotes(await listTicketNotes(ticket.id))
+              onNoted()
             })
           }}
         >

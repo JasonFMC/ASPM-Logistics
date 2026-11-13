@@ -59,6 +59,21 @@ alter table public.staff
 alter table public.staff
   add column if not exists has_claimed boolean not null default false;
 
+alter table public.staff
+  add column if not exists claim_senders text not null default '';
+
+alter table public.staff
+  add column if not exists claim_titles text not null default '';
+
+alter table public.staff
+  add column if not exists claim_has_attachment boolean not null default false;
+
+alter table public.staff drop constraint if exists staff_claim_priority_check;
+alter table public.staff drop column if exists claim_priority;
+
+alter table public.tickets
+  add column if not exists claim_auto boolean not null default false;
+
 update public.staff as s
 set has_claimed = true
 where s.id in (select claimed_by from public.tickets where claimed_by is not null)
@@ -227,6 +242,22 @@ begin
 end;
 $$;
 
+-- 亲手放回过的单，不再被同一个人自动领回去。
+create table if not exists public.ticket_claim_skips (
+  ticket_id uuid not null references public.tickets (id) on delete cascade,
+  staff_id uuid not null references public.staff (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (ticket_id, staff_id)
+);
+
+alter table public.ticket_claim_skips enable row level security;
+drop policy if exists "ticket claim skips for authenticated" on public.ticket_claim_skips;
+create policy "ticket claim skips for authenticated"
+  on public.ticket_claim_skips for select to authenticated
+  using (true);
+
+grant select on public.ticket_claim_skips to authenticated;
+
 create or replace function public.claim_ticket(p_ticket_id uuid, p_token text)
 returns void
 language plpgsql
@@ -247,7 +278,8 @@ begin
     raise exception '已经有人领了';
   end if;
   perform set_config('aspm.claim', '1', true);
-  update public.tickets set claimed_by = who.id, updated_at = now() where id = p_ticket_id;
+  update public.tickets set claimed_by = who.id, claim_auto = false, updated_at = now() where id = p_ticket_id;
+  delete from public.ticket_claim_skips where ticket_id = p_ticket_id and staff_id = who.id;
   update public.staff set has_claimed = true where id = who.id;
   insert into public.ticket_events (ticket_id, from_status, to_status, actor_id, note)
   values (p_ticket_id, status, status, auth.uid(), who.display_name || ' 领取了任务');
@@ -279,7 +311,10 @@ begin
     raise exception '只能放回自己领取的任务';
   end if;
   perform set_config('aspm.claim', '1', true);
-  update public.tickets set claimed_by = null, updated_at = now() where id = p_ticket_id;
+  update public.tickets set claimed_by = null, claim_auto = false, updated_at = now() where id = p_ticket_id;
+  insert into public.ticket_claim_skips (ticket_id, staff_id)
+  values (p_ticket_id, current)
+  on conflict (ticket_id, staff_id) do nothing;
   insert into public.ticket_events (ticket_id, from_status, to_status, actor_id, note)
   values (p_ticket_id, status, status, auth.uid(), who.display_name || ' 放回了任务');
 end;
@@ -295,6 +330,7 @@ declare
   admin boolean;
   status text;
   name text;
+  current uuid;
 begin
   if auth.uid() is null then
     raise exception '未登录';
@@ -303,7 +339,7 @@ begin
   if admin is not true then
     raise exception '只有管理员可以改派';
   end if;
-  select tickets.status into status from public.tickets where id = p_ticket_id;
+  select tickets.status, claimed_by into status, current from public.tickets where id = p_ticket_id;
   if status is null then
     raise exception '找不到这张工单';
   end if;
@@ -316,8 +352,15 @@ begin
   end if;
   perform set_config('aspm.claim', '1', true);
   update public.tickets
-  set claimed_by = p_staff_id, updated_at = now()
+  set claimed_by = p_staff_id, claim_auto = false, updated_at = now()
   where id = p_ticket_id;
+  if p_staff_id is null and current is not null then
+    insert into public.ticket_claim_skips (ticket_id, staff_id)
+    values (p_ticket_id, current)
+    on conflict (ticket_id, staff_id) do nothing;
+  elsif p_staff_id is not null then
+    delete from public.ticket_claim_skips where ticket_id = p_ticket_id and staff_id = p_staff_id;
+  end if;
   insert into public.ticket_events (ticket_id, from_status, to_status, actor_id, note)
   values (
     p_ticket_id,
@@ -444,6 +487,68 @@ begin
 end;
 $$;
 
+create or replace function public.set_staff_pin(p_staff_id uuid, p_pin text)
+returns void
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  admin boolean;
+  person public.staff;
+  pin text := trim(coalesce(p_pin, ''));
+begin
+  if auth.uid() is null then
+    raise exception '未登录';
+  end if;
+  select is_desk_admin into admin from public.profiles where id = auth.uid();
+  if admin is not true then
+    raise exception '只有管理员可以管理员工';
+  end if;
+  if char_length(pin) < 4 or char_length(pin) > 20 then
+    raise exception '密码用 4 到 20 位';
+  end if;
+  select * into person from public.staff where id = p_staff_id;
+  if not found then
+    raise exception '没有这位员工';
+  end if;
+  insert into public.staff_secrets (staff_id, pin_hash, pin_text)
+  values (person.id, crypt(pin, gen_salt('bf')), pin)
+  on conflict (staff_id) do update
+  set pin_hash = excluded.pin_hash,
+      pin_text = excluded.pin_text;
+  delete from public.staff_sessions where staff_id = person.id;
+end;
+$$;
+
+create or replace function public.update_my_look(p_token text, p_look jsonb)
+returns int
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  who public.staff;
+begin
+  who := public.desk_staff(p_token);
+  if p_look is null
+     or jsonb_typeof(p_look) is distinct from 'object'
+     or coalesce(p_look ->> 'face', '') !~ '^[0-3]$'
+     or coalesce(p_look ->> 'eyes', '') !~ '^[0-3]$'
+     or coalesce(p_look ->> 'ears', '') !~ '^[0-3]$'
+     or coalesce(p_look ->> 'mouth', '') !~ '^[0-3]$'
+     or coalesce(p_look ->> 'backdrop', '') !~ '^[0-3]$'
+     or coalesce(p_look ->> 'color', '') !~ '^[0-7]$' then
+    raise exception '头像拼得不完整';
+  end if;
+  update public.staff
+  set look = p_look,
+      hue = (p_look ->> 'color')::int
+  where id = who.id;
+  return (p_look ->> 'color')::int;
+end;
+$$;
+
 create or replace function public.set_staff_hidden(p_staff_id uuid, p_hidden boolean)
 returns void
 language plpgsql
@@ -495,6 +600,356 @@ begin
 end;
 $$;
 
+-- 帮助同事。单子仍归原领取人。换领取人时，这次帮助清掉。
+create table if not exists public.ticket_helpers (
+  ticket_id uuid not null references public.tickets (id) on delete cascade,
+  staff_id uuid not null references public.staff (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (ticket_id, staff_id)
+);
+
+create index if not exists ticket_helpers_staff_idx on public.ticket_helpers (staff_id);
+
+alter table public.ticket_helpers enable row level security;
+drop policy if exists "ticket helpers for authenticated" on public.ticket_helpers;
+create policy "ticket helpers for authenticated"
+  on public.ticket_helpers for select to authenticated
+  using (true);
+
+grant select on public.ticket_helpers to authenticated;
+
+-- 页面只能查询帮忙记录，不能删除。触发器若按登录人执行，删除会被拒绝，
+-- 领取人这一下更新会整单撤销，放回就像没点上。这里改由函数所有者执行。
+create or replace function public.clear_ticket_helpers()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if new.claimed_by is distinct from old.claimed_by then
+    delete from public.ticket_helpers where ticket_id = new.id;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists tickets_clear_helpers on public.tickets;
+create trigger tickets_clear_helpers
+  after update of claimed_by on public.tickets
+  for each row
+  execute function public.clear_ticket_helpers();
+
+create or replace function public.help_colleague(p_ticket_id uuid, p_token text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  who public.staff;
+  current uuid;
+  status text;
+  owner text;
+begin
+  who := public.desk_staff(p_token);
+  select claimed_by, tickets.status into current, status from public.tickets where id = p_ticket_id;
+  if status is null then
+    raise exception '找不到这张工单';
+  end if;
+  if status in ('done', 'cancelled') then
+    raise exception '这张单已经结束';
+  end if;
+  if current is null then
+    raise exception '还没有同事领这张单';
+  end if;
+  if current = who.id then
+    raise exception '这是自己的单';
+  end if;
+  select display_name into owner from public.staff where id = current;
+  insert into public.ticket_helpers (ticket_id, staff_id)
+  values (p_ticket_id, who.id)
+  on conflict (ticket_id, staff_id) do nothing;
+  insert into public.ticket_events (ticket_id, from_status, to_status, actor_id, note)
+  values (p_ticket_id, status, status, auth.uid(), who.display_name || ' 来帮助 ' || coalesce(owner, '同事'));
+end;
+$$;
+
+create or replace function public.leave_help(p_ticket_id uuid, p_token text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  who public.staff;
+  status text;
+begin
+  who := public.desk_staff(p_token);
+  select tickets.status into status from public.tickets where id = p_ticket_id;
+  if status is null then
+    raise exception '找不到这张工单';
+  end if;
+  delete from public.ticket_helpers where ticket_id = p_ticket_id and staff_id = who.id;
+  insert into public.ticket_events (ticket_id, from_status, to_status, actor_id, note)
+  values (p_ticket_id, status, status, auth.uid(), who.display_name || ' 不再帮助这张单');
+end;
+$$;
+
+-- 自动领取看客户名称归了谁。客户名下的任务，还没人领的记到这个人身上。
+-- 已经亲手领走或管理员改派的（claim_auto 为 false）不动。
+-- 这个人亲手放回过的单不再自动领回。
+-- 几位同事的客户都对上同一张单时，按同事建立先后，先建立的领到。
+-- 客户不再归这个人时，只放回自动领的。
+
+create or replace function public.claim_rule_lines(p_text text)
+returns text[]
+language sql
+immutable
+as $$
+  select coalesce(array_agg(line), '{}'::text[])
+  from (
+    select btrim(piece) as line
+    from regexp_split_to_table(coalesce(p_text, ''), E'[\r\n]+') as piece
+    where btrim(piece) <> ''
+  ) lines;
+$$;
+
+create or replace function public.claim_sender_matches(p_email text, p_rules text[])
+returns boolean
+language plpgsql
+immutable
+as $$
+declare
+  rule text;
+  email text := lower(btrim(coalesce(p_email, '')));
+  domain text := '';
+  needle text;
+begin
+  if coalesce(array_length(p_rules, 1), 0) = 0 then
+    return true;
+  end if;
+  if email = '' then
+    return false;
+  end if;
+  if position('@' in email) > 0 then
+    domain := substring(email from '[^@]+$');
+  end if;
+  foreach rule in array p_rules loop
+    needle := lower(btrim(rule));
+    if left(needle, 1) = '@' then
+      needle := substr(needle, 2);
+    end if;
+    if needle = '' then
+      continue;
+    end if;
+    if position('@' in needle) > 0 then
+      if email = needle then
+        return true;
+      end if;
+    elsif domain = needle then
+      return true;
+    end if;
+  end loop;
+  return false;
+end;
+$$;
+
+create or replace function public.claim_title_matches(p_title text, p_rules text[])
+returns boolean
+language plpgsql
+immutable
+as $$
+declare
+  rule text;
+  title text := lower(coalesce(p_title, ''));
+begin
+  if coalesce(array_length(p_rules, 1), 0) = 0 then
+    return true;
+  end if;
+  foreach rule in array p_rules loop
+    if strpos(title, lower(btrim(rule))) > 0 then
+      return true;
+    end if;
+  end loop;
+  return false;
+end;
+$$;
+
+create or replace function public.ticket_matches_claim(
+  p_senders text,
+  p_titles text,
+  p_status text,
+  p_email text,
+  p_title text
+)
+returns boolean
+language plpgsql
+immutable
+as $$
+declare
+  senders text[] := public.claim_rule_lines(p_senders);
+  titles text[] := public.claim_rule_lines(p_titles);
+begin
+  if coalesce(array_length(senders, 1), 0) = 0
+     and coalesce(array_length(titles, 1), 0) = 0 then
+    return false;
+  end if;
+  if p_status in ('done', 'cancelled') then
+    return false;
+  end if;
+  if not public.claim_sender_matches(p_email, senders) then
+    return false;
+  end if;
+  if not public.claim_title_matches(p_title, titles) then
+    return false;
+  end if;
+  return true;
+end;
+$$;
+
+create or replace function public.apply_auto_claims()
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  person public.staff;
+begin
+  if auth.uid() is null then
+    raise exception '未登录';
+  end if;
+  perform set_config('aspm.claim', '1', true);
+
+  with released as (
+    update public.tickets as t
+    set claimed_by = null,
+        claim_auto = false,
+        updated_at = now()
+    where t.claim_auto
+      and t.claimed_by is not null
+      and t.status in ('new', 'in_progress', 'waiting')
+      and not exists (
+        select 1
+        from public.ticket_folder_items as item
+        join public.ticket_folders as folder on folder.id = item.folder_id
+        where item.ticket_id = t.id
+          and folder.kind = 'customer'
+          and folder.claim_staff_id = t.claimed_by
+      )
+    returning t.id, t.status
+  )
+  insert into public.ticket_events (ticket_id, from_status, to_status, actor_id, note)
+  select id, status, status, auth.uid(), '客户不再归这位同事，已放回'
+  from released;
+
+  for person in
+    select * from public.staff
+    where not hidden
+    order by created_at, id
+  loop
+    with claimed as (
+      update public.tickets as t
+      set claimed_by = person.id,
+          claim_auto = true,
+          updated_at = now()
+      where t.claimed_by is null
+        and t.status in ('new', 'in_progress', 'waiting')
+        and not exists (
+          select 1
+          from public.ticket_claim_skips as skipped
+          where skipped.ticket_id = t.id
+            and skipped.staff_id = person.id
+        )
+        and exists (
+          select 1
+          from public.ticket_folder_items as item
+          join public.ticket_folders as folder on folder.id = item.folder_id
+          where item.ticket_id = t.id
+            and folder.kind = 'customer'
+            and folder.claim_staff_id = person.id
+        )
+      returning t.id, t.status
+    )
+    insert into public.ticket_events (ticket_id, from_status, to_status, actor_id, note)
+    select id, status, status, auth.uid(), person.display_name || ' 自动领取了任务'
+    from claimed;
+
+    if exists (select 1 from public.tickets where claimed_by = person.id) then
+      update public.staff set has_claimed = true where id = person.id and has_claimed is not true;
+    end if;
+  end loop;
+end;
+$$;
+
+drop function if exists public.ticket_matches_claim(text, text, boolean, text, text, text, boolean);
+
+drop function if exists public.save_claim_rules(uuid, text, text, text, boolean);
+drop function if exists public.save_claim_rules(uuid, text, text, text, text);
+drop function if exists public.save_claim_rules(uuid, text, text, text);
+
+create or replace function public.assign_claim_folder(
+  p_folder_id uuid,
+  p_staff_id uuid,
+  p_token text
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  admin boolean;
+  who public.staff;
+  folder public.ticket_folders;
+begin
+  if auth.uid() is null then
+    raise exception '未登录';
+  end if;
+  select * into folder from public.ticket_folders where id = p_folder_id;
+  if not found then
+    raise exception '没有这个客户';
+  end if;
+  if folder.kind is distinct from 'customer' then
+    raise exception '只能领取客户';
+  end if;
+  select is_desk_admin into admin from public.profiles where id = auth.uid();
+  if p_staff_id is null then
+    if admin is not true then
+      who := public.desk_staff(p_token);
+      if folder.claim_staff_id is distinct from who.id then
+        raise exception '只能放回自己领取的客户';
+      end if;
+    end if;
+  else
+    if not exists (select 1 from public.staff where id = p_staff_id and hidden is not true) then
+      raise exception '没有这位同事';
+    end if;
+    if admin is not true then
+      who := public.desk_staff(p_token);
+      if who.id is distinct from p_staff_id then
+        raise exception '只能领给自己';
+      end if;
+    end if;
+  end if;
+  update public.ticket_folders
+  set claim_staff_id = p_staff_id,
+      updated_at = now()
+  where id = p_folder_id;
+  perform public.apply_auto_claims();
+end;
+$$;
+
+revoke all on function public.claim_rule_lines(text) from public, anon, authenticated;
+revoke all on function public.claim_sender_matches(text, text[]) from public, anon, authenticated;
+revoke all on function public.claim_title_matches(text, text[]) from public, anon, authenticated;
+revoke all on function public.ticket_matches_claim(text, text, text, text, text) from public, anon, authenticated;
+revoke all on function public.help_colleague(uuid, text) from public;
+revoke all on function public.leave_help(uuid, text) from public;
+revoke all on function public.apply_auto_claims() from public;
+revoke all on function public.assign_claim_folder(uuid, uuid, text) from public;
+
 revoke all on function public.create_staff(text, text, int, jsonb) from public;
 revoke all on function public.enter_desk(uuid, text) from public;
 revoke all on function public.desk_staff(text) from public;
@@ -503,6 +958,8 @@ revoke all on function public.release_ticket(uuid, text) from public;
 revoke all on function public.reassign_ticket(uuid, uuid) from public;
 revoke all on function public.admin_staff_list() from public;
 revoke all on function public.rename_staff(uuid, text) from public;
+revoke all on function public.set_staff_pin(uuid, text) from public;
+revoke all on function public.update_my_look(text, jsonb) from public;
 revoke all on function public.set_staff_hidden(uuid, boolean) from public;
 revoke all on function public.delete_staff(uuid) from public;
 revoke all on function public.update_my_staff(text, text, text) from public;
@@ -514,8 +971,14 @@ grant execute on function public.release_ticket(uuid, text) to authenticated;
 grant execute on function public.reassign_ticket(uuid, uuid) to authenticated;
 grant execute on function public.admin_staff_list() to authenticated;
 grant execute on function public.rename_staff(uuid, text) to authenticated;
+grant execute on function public.set_staff_pin(uuid, text) to authenticated;
+grant execute on function public.update_my_look(text, jsonb) to authenticated;
 grant execute on function public.set_staff_hidden(uuid, boolean) to authenticated;
 grant execute on function public.delete_staff(uuid) to authenticated;
 grant execute on function public.update_my_staff(text, text, text) to authenticated;
+grant execute on function public.help_colleague(uuid, text) to authenticated;
+grant execute on function public.leave_help(uuid, text) to authenticated;
+grant execute on function public.apply_auto_claims() to authenticated;
+grant execute on function public.assign_claim_folder(uuid, uuid, text) to authenticated;
 
 notify pgrst, 'reload schema';

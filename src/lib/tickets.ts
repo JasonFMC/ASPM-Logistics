@@ -41,17 +41,45 @@ export const TICKET_SOURCE_LABEL = {
   manual: '手动',
 } as const
 
-const TICKET_SELECT = '*, warehouses(id, name), customers(id, name), assignee:staff!tickets_claimed_by_fkey(id, display_name, hue)'
+const TICKET_SELECT = '*, warehouses(id, name), assignee:staff!tickets_claimed_by_fkey(id, display_name, hue)'
 
-export type TicketListStatus = TicketStatus | 'open' | 'all'
+export type TicketPool = 'unassigned' | 'claimed' | 'waiting' | 'done' | 'all'
+
+export const WORK_STEPS = [
+  { id: 'unassigned', label: '未分配' },
+  { id: 'claimed', label: '处理中' },
+  { id: 'waiting', label: '等待' },
+  { id: 'done', label: '确认完成' },
+] as const
+
+export type WorkStep = (typeof WORK_STEPS)[number]['id']
+
+/** 一张单现在停在哪一步：先看有没有领走，再看是不是在等或已经做完。 */
+export function workStep(ticket: { status: TicketStatus; claimed_by?: string | null }): WorkStep | 'cancelled' {
+  if (ticket.status === 'cancelled') return 'cancelled'
+  if (ticket.status === 'done') return 'done'
+  if (ticket.status === 'waiting') return 'waiting'
+  if (ticket.claimed_by || ticket.status === 'in_progress') return 'claimed'
+  return 'unassigned'
+}
 
 export interface TicketFilter {
-  status?: TicketListStatus
+  pool?: TicketPool
   batch?: TicketBatch
   warehouseId?: string | 'all'
 }
 
+function poolRank(ticket: Ticket) {
+  if (ticket.status === 'cancelled') return 4
+  if (ticket.status === 'done') return 3
+  if (ticket.status === 'waiting') return 2
+  if (ticket.claimed_by) return 1
+  return 0
+}
+
 function compareTickets(a: Ticket, b: Ticket) {
+  const stage = poolRank(a) - poolRank(b)
+  if (stage !== 0) return stage
   const urgentA = a.priority === 'urgent' ? 0 : 1
   const urgentB = b.priority === 'urgent' ? 0 : 1
   if (urgentA !== urgentB) return urgentA - urgentB
@@ -86,16 +114,40 @@ export async function renameWarehouse(id: string, name: string) {
   return data as Warehouse
 }
 
-export async function listTickets(filter: TicketFilter = {}) {
-  let query = supabase
-    .from('tickets')
-    .select(TICKET_SELECT)
-    .order('received_at', { ascending: false, nullsFirst: false })
-    .order('created_at', { ascending: false })
-    .limit(200)
+const DONE_KEEP_MS = 730 * 24 * 60 * 60 * 1000
 
-  if (filter.status === 'open') query = query.not('status', 'in', '(done,cancelled)')
-  else if (filter.status && filter.status !== 'all') query = query.eq('status', filter.status)
+/** 确认完成满两年就删掉，不再留在任务池或全部里。 */
+export async function purgeOldDoneTickets() {
+  const cutoff = new Date(Date.now() - DONE_KEEP_MS).toISOString()
+  await supabase.from('tickets').delete().eq('status', 'done').lt('closed_at', cutoff)
+  await supabase.from('tickets').delete().eq('status', 'done').is('closed_at', null).lt('updated_at', cutoff)
+}
+
+function stillKept(ticket: Ticket) {
+  if (ticket.status !== 'done') return true
+  const at = Date.parse(ticket.closed_at || ticket.updated_at)
+  return !Number.isFinite(at) || Date.now() - at <= DONE_KEEP_MS
+}
+
+export async function listTickets(filter: TicketFilter = {}) {
+  await purgeOldDoneTickets()
+  let query = supabase.from('tickets').select(TICKET_SELECT)
+  if (filter.pool === 'done') {
+    query = query.order('closed_at', { ascending: false, nullsFirst: false }).order('updated_at', { ascending: false })
+  } else {
+    query = query.order('received_at', { ascending: false, nullsFirst: false }).order('created_at', { ascending: false })
+  }
+  query = query.limit(filter.pool === 'done' ? 2000 : 200)
+
+  if (filter.pool === 'unassigned') {
+    query = query.not('status', 'in', '(done,cancelled)')
+  } else if (filter.pool === 'claimed') {
+    query = query.not('claimed_by', 'is', null).in('status', ['new', 'in_progress', 'waiting'])
+  } else if (filter.pool === 'waiting') {
+    query = query.eq('status', 'waiting')
+  } else if (filter.pool === 'done') {
+    query = query.eq('status', 'done')
+  }
   if (filter.batch) query = query.eq('batch', filter.batch)
   if (filter.warehouseId && filter.warehouseId !== 'all') {
     query = query.eq('warehouse_id', filter.warehouseId)
@@ -103,7 +155,107 @@ export async function listTickets(filter: TicketFilter = {}) {
 
   const { data, error } = await query
   if (error) throw error
-  return ((data ?? []) as Ticket[]).sort(compareTickets)
+  return ((data ?? []) as Ticket[]).filter(stillKept).sort(compareTickets)
+}
+
+export interface TicketSearchInput {
+  folderIds: string[] | null
+  sender: string
+  title: string
+  keyword: string
+  from: string
+  to: string
+}
+
+function dayStamp(value: string) {
+  const date = new Date(value)
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${date.getFullYear()}-${month}-${day}`
+}
+
+function letterPlain(payload: unknown) {
+  if (!payload || typeof payload !== 'object') return ''
+  const html = (payload as { html?: unknown }).html
+  return typeof html === 'string' ? html.replace(/<[^>]+>/g, ' ') : ''
+}
+
+/** 关键字在标题、摘要，以及还留着的原信正文里找。 */
+export async function searchTickets(input: TicketSearchInput) {
+  const sender = input.sender.trim().toLowerCase()
+  const title = input.title.trim().toLowerCase()
+  const words = input.keyword
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+  const rows: Ticket[] = []
+  for (let from = 0; ; from += 1000) {
+    const page = await supabase
+      .from('tickets')
+      .select(TICKET_SELECT)
+      .order('received_at', { ascending: false, nullsFirst: false })
+      .range(from, from + 999)
+    if (page.error) throw page.error
+    rows.push(...((page.data ?? []) as Ticket[]))
+    if ((page.data ?? []).length < 1000) break
+  }
+  const folderIds = input.folderIds ? new Set(input.folderIds) : null
+  const matched: Ticket[] = []
+  const needLetter: Ticket[] = []
+  for (const ticket of rows) {
+    if (folderIds && !folderIds.has(ticket.id)) continue
+    const when = dayStamp(ticket.received_at || ticket.created_at)
+    if (input.from && when < input.from) continue
+    if (input.to && when > input.to) continue
+    const fromText = `${ticket.from_name ?? ''} ${ticket.from_email ?? ''}`.toLowerCase()
+    if (sender && !fromText.includes(sender)) continue
+    if (title && !ticket.title.toLowerCase().includes(title)) continue
+    const hay = `${ticket.title}\n${ticket.summary ?? ''}`.toLowerCase()
+    if (words.length && !words.every((word) => hay.includes(word))) {
+      needLetter.push(ticket)
+      continue
+    }
+    matched.push(ticket)
+  }
+  if (words.length && needLetter.length) {
+    const hits = new Set<string>()
+    for (let start = 0; start < needLetter.length; start += 40) {
+      const slice = needLetter.slice(start, start + 40).map((ticket) => ticket.id)
+      const { data, error } = await supabase.from('ticket_letters').select('ticket_id, payload').in('ticket_id', slice)
+      if (!error) {
+        for (const row of data ?? []) {
+          const text = `${letterPlain(row.payload)}`.toLowerCase()
+          if (words.every((word) => text.includes(word))) hits.add(String(row.ticket_id))
+        }
+      }
+      const messages = await supabase.from('ticket_messages').select('ticket_id, body').in('ticket_id', slice)
+      if (!messages.error) {
+        const blobs = new Map<string, string>()
+        for (const row of messages.data ?? []) {
+          const id = String(row.ticket_id)
+          blobs.set(id, `${blobs.get(id) ?? ''}\n${typeof row.body === 'string' ? row.body : ''}`)
+        }
+        for (const [id, text] of blobs) {
+          if (words.every((word) => text.toLowerCase().includes(word))) hits.add(id)
+        }
+      }
+    }
+    matched.push(...needLetter.filter((ticket) => hits.has(ticket.id)))
+  }
+  return matched.filter(stillKept).sort(compareTickets)
+}
+
+export async function listTicketsByIds(ids: string[]) {
+  if (!ids.length) return []
+  const rows: Ticket[] = []
+  for (let start = 0; start < ids.length; start += 100) {
+    const slice = ids.slice(start, start + 100)
+    const { data, error } = await supabase.from('tickets').select(TICKET_SELECT).in('id', slice)
+    if (error) throw error
+    rows.push(...((data ?? []) as Ticket[]))
+  }
+  return rows.sort(compareTickets)
 }
 
 export async function getTicket(id: string) {
@@ -158,13 +310,6 @@ export async function createManualTicket(input: {
     note: '手动新建',
   })
   return ticket
-}
-
-/** Desktop Outlook on this PC. A browser cannot open one IMAP message inside Outlook. */
-export function originalMailUrl(ticket: Pick<Ticket, 'message_id'>): string | null {
-  const id = ticket.message_id?.trim()
-  if (!id) return null
-  return `aspm-mail:${encodeURIComponent(id)}`
 }
 
 export async function setTicketStatus(
@@ -359,45 +504,6 @@ export async function addTicketNote(ticketId: string, body: string, staffId: str
   if (error) throw error
 }
 
-/** 把这个发件人加进客户白名单，以后同域来信自动归到这个仓。 */
-export async function addSenderToWhitelist(ticket: Ticket, customerName: string) {
-  const name = customerName.trim()
-  const email = ticket.from_email?.trim().toLowerCase()
-  if (!name) throw new Error('请填写客户名')
-  if (!email) throw new Error('这封没有发件人地址，不能加白名单')
-
-  const { data: existing } = await supabase
-    .from('customers')
-    .select('*')
-    .eq('name', name)
-    .maybeSingle()
-
-  let customerId = existing?.id as string | undefined
-  if (!customerId) {
-    const { data, error } = await supabase
-      .from('customers')
-      .insert({ name, warehouse_id: ticket.warehouse_id })
-      .select('id')
-      .single()
-    if (error) throw error
-    customerId = data.id as string
-  }
-
-  const { error: senderError } = await supabase
-    .from('customer_senders')
-    .upsert({ customer_id: customerId, pattern: email }, { onConflict: 'pattern' })
-  if (senderError) throw senderError
-
-  const { data, error } = await supabase
-    .from('tickets')
-    .update({ customer_id: customerId, is_new_sender: false, updated_at: new Date().toISOString() })
-    .eq('id', ticket.id)
-    .select(TICKET_SELECT)
-    .single()
-  if (error) throw error
-  return data as Ticket
-}
-
 export async function listWorkflows() {
   const { data, error } = await supabase
     .from('workflows')
@@ -568,6 +674,9 @@ export interface PullResult {
   lastUid?: number
   mailboxMaxUid?: number
   pending?: number
+  archived?: number
+  threaded?: number
+  oldest?: string | null
 }
 
 export interface PullProgress {
@@ -576,12 +685,13 @@ export interface PullProgress {
   detail?: string
 }
 
-/** 拉取新邮件进度条上的步骤。「写入工单」从 30% 走到 95%，按已处理的封数推进。 */
+/** 更新邮件进度条上的步骤。「写入工单」从 30% 走到 95%，按已处理的封数推进。 */
 export const PULL_STEPS = [
   { pct: 10, step: '已接到请求' },
   { pct: 20, step: '连上邮箱' },
   { pct: 30, step: '找到新信' },
   { pct: 31, step: '写入工单' },
+  { pct: 96, step: '核对挪走的信' },
   { pct: 100, step: '完成' },
 ]
 
@@ -609,7 +719,7 @@ export async function pullMail(onProgress: (update: PullProgress) => void = () =
       body: '{}',
     })
   } catch {
-    throw new Error('浏览器没有连上拉信服务，请检查网络后再点一次。')
+    throw new Error('浏览器没有连上更新服务，请检查网络后再点一次。')
   }
   if (!response.ok) {
     const text = (await response.text()).trim()
@@ -662,7 +772,13 @@ export async function pullMail(onProgress: (update: PullProgress) => void = () =
     }
   }
   handle(pending + decoder.decode())
-  if (!result) throw new Error(`读到「${lastStep}」后拉信服务断开了，没有说明原因。`)
+  if (!result) {
+    throw new Error(
+      lastStep === '写入工单'
+        ? '写入工单做到一半，拉信服务超时断开了。已经写上的任务还在，再点一次「更新邮件」会从剩下的继续。'
+        : `读到「${lastStep}」后拉信服务断开了，没有说明原因。`,
+    )
+  }
   return result as PullResult
 }
 
